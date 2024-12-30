@@ -1,4 +1,4 @@
-# DNS Scanner and Listener (with Spoof Scanning)
+# DNS Scanner and Listener
 
 >Disclaimer - This code was written for educational purposes. 
 
