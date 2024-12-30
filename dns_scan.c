@@ -44,13 +44,13 @@ unsigned char *encapsulateUDP(unsigned char *buffer, int *payloadSize, int dst_p
         exit(EXIT_FAILURE);
     }
 
-    memcpy(&tmp[sizeof(struct udphdr)], buffer, *payloadSize);
+    memcpy(tmp + sizeof(struct udphdr), buffer, *payloadSize);
 
     struct udphdr *udph = (struct udphdr *) tmp;
-    udph -> source = htons(rand());
-    udph -> dest = htons(dst_port);
-    udph -> check = 0; //UDP checksum 0 means checksum unused!
-    udph -> len = htons((*payloadSize) + 8);
+    udph->uh_sport = htons(53535);  // Always use our fixed port
+    udph->uh_dport = htons(dst_port);
+    udph->uh_ulen = htons(sizeof(struct udphdr) + *payloadSize);
+    udph->uh_sum = 0;  // UDP checksum is optional, set to 0
     *payloadSize += sizeof(struct udphdr);
 
     return tmp;
@@ -58,38 +58,38 @@ unsigned char *encapsulateUDP(unsigned char *buffer, int *payloadSize, int dst_p
 
 unsigned char *encapsulateIP(unsigned char *buffer, int *payloadSize, in_addr_t sourceIP, in_addr_t destIP) {
     unsigned char *tmp = NULL;
-    tmp = realloc(buffer, *payloadSize + sizeof(struct iphdr));
+    tmp = realloc(buffer, *payloadSize + sizeof(struct ip));
 
     if(!tmp) {
         perror("encapsulateUDP :: Couldn't reallocate buffer");
         exit(EXIT_FAILURE);
     }
 
-    memcpy(&tmp[sizeof(struct iphdr)], buffer, *payloadSize);
+    memcpy(tmp + sizeof(struct ip), buffer, *payloadSize);
 
-    struct iphdr *iph = (struct iphdr *) buffer;
-    iph -> version = 4;
-    iph -> ihl = 5; //minimum number of octets
-    iph -> tos = 0;
-    iph -> tot_len = htons(*payloadSize + sizeof(struct iphdr)); //len = data + header
-    iph -> id = htons(4321);
-    iph -> frag_off = 0;
-    iph -> ttl = MAXTTL;
-    iph -> protocol = IPPROTO_UDP;
-    iph -> check = 0;
-    iph -> saddr = sourceIP;
-    iph -> daddr = destIP;
+    struct ip *iph = (struct ip *) tmp;
+    iph -> ip_v = 4;
+    iph -> ip_hl = 5; //minimum number of octets
+    iph -> ip_tos = 0;
+    iph -> ip_len = htons(*payloadSize + sizeof(struct ip)); //len = data + header
+    iph -> ip_id = htons(4321);
+    iph -> ip_off = 0;
+    iph -> ip_ttl = MAXTTL;
+    iph -> ip_p = IPPROTO_UDP;
+    iph -> ip_sum = 0;
+    iph -> ip_src.s_addr = sourceIP;
+    iph -> ip_dst.s_addr = destIP;
 
-    iph -> check = checksum(tmp, iph -> ihl * 2); //ip header length is the number of 32-bit words, but csum uses 16 bit words
+    iph -> ip_sum = checksum(tmp, iph -> ip_hl * 2); //ip header length is the number of 32-bit words, but csum uses 16 bit words
 
-    *payloadSize += sizeof(struct iphdr);
+    *payloadSize += sizeof(struct ip);
 
     return tmp;
 }
 
 void *scan_thread(void *args) {
 
-    //TO-DO: Remove scanning special purpose IP ranges (private IPs)
+    // TODO Remove scanning special purpose IP ranges (private IPs)
     //as per https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml
     
     Thread_Data *td = (Thread_Data *) args;
@@ -100,86 +100,162 @@ void *scan_thread(void *args) {
     int socket_type = SOCK_DGRAM;
     int socket_protocol = IPPROTO_UDP;
 
-    //add the record 
-    buff = addRecord(buff, td -> host, &payloadSize);
-    //add the record details
+    // Build DNS packet in correct order:
+    // 1. Start with DNS header
+    buff = encapsulateDNS(NULL, &payloadSize);
+    
+    // 2. Add query name
+    buff = addRecord(buff, td->host, &payloadSize);
+    
+    // 3. Add question section (type and class)
     buff = addQuestion(buff, &payloadSize);
-    //add extended DNS
+    
+    // 4. Add EDNS record
     buff = addEDNS(buff, &payloadSize);
-    //add DNS header around data
-    buff = encapsulateDNS(buff, &payloadSize);
+    
+    printf("\nThread built DNS query packet for %s\n", td->host);
 
-    if(td->spoof_ip) {
-        socket_type = SOCK_RAW;
-        socket_protocol = IPPROTO_RAW;
-        //add UDP header
-        buff = encapsulateUDP(buff, &payloadSize, 53); //port 53 default dns
-        buff = encapsulateIP(buff, &payloadSize, td -> spoof_ip, 0);
+    // Read the port that the listener is using first
+    int listen_port = 0;
+    FILE *port_file = fopen("/tmp/dns_scanner_port", "r");
+    if (port_file) {
+        fscanf(port_file, "%d", &listen_port);
+        fclose(port_file);
+        printf("Thread using listener port: %d\n", listen_port);
+    } else {
+        printf("Warning: Could not read listener port\n");
     }
+
+    // if(td->spoof_ip) {
+    //     socket_type = SOCK_RAW;
+    //     socket_protocol = IPPROTO_RAW;
+        
+    //     //add UDP header with our listening port as source
+    //     buff = encapsulateUDP(buff, &payloadSize, 53); //port 53 default dns
+    //     struct udphdr *udph = (struct udphdr *)buff;
+    //     udph->uh_sport = htons(listen_port ? listen_port : rand());
+    //     buff = encapsulateIP(buff, &payloadSize, td->spoof_ip, 0);
+    // }
 
     int sockfd = socket(AF_INET, socket_type, socket_protocol);
     if(sockfd < 0) {
-        perror("Coudn't create socket");
-        exit(-1);
+        perror("Couldn't create socket");
+        return NULL;
+    }
+
+    // Set socket options
+    int option = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option)) < 0) {
+        perror("setsockopt SO_REUSEADDR failed");
+        close(sockfd);
+        return NULL;
+    }
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &option, sizeof(option)) < 0) {
+        perror("setsockopt SO_REUSEPORT failed");
+        close(sockfd);
+        return NULL;
+    }
+
+    // Bind socket if not spoofing
+    if (!td->spoof_ip && listen_port > 0) {
+        struct sockaddr_in bind_addr;
+        memset(&bind_addr, 0, sizeof(bind_addr));
+        bind_addr.sin_family = AF_INET;
+        bind_addr.sin_addr.s_addr = INADDR_ANY;
+        bind_addr.sin_port = htons(listen_port);
+
+        if (bind(sockfd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+            perror("Couldn't bind socket");
+            close(sockfd);
+            return NULL;
+        }
     }
 
     struct sockaddr_in server_addr;
-    for(uint32_t ip = td -> start; ip < td -> start + td -> amount + 1; ip++) {
-
+    for(uint32_t ip = td->start; ip < td->start + td->amount + 1; ip++) {
         memset(&server_addr, 0, sizeof(server_addr));
-
         server_addr.sin_family = AF_INET;
         server_addr.sin_addr.s_addr = htonl(ip);
+        server_addr.sin_port = htons(53);  // DNS port
 
-        if(td -> spoof_ip) {
-            //add IP header with spoofed source IP
-            struct iphdr *iph = (struct iphdr *)buff;
-            iph -> daddr = htonl(ip);
-            iph -> check = checksum(iph, iph -> ihl *2);
-            server_addr.sin_port = 0;
-        }
-        else
-            server_addr.sin_port = htons(53);
-        
+        // if(td->spoof_ip) {
+        //     struct ip *iph = (struct ip *)buff;
+        //     iph->ip_dst.s_addr = htonl(ip);
+        //     iph->ip_sum = checksum(iph, iph->ip_hl * 2);
+        //     server_addr.sin_port = htons(0);
+        // }
+
         int sent = sendto(sockfd, (char *) buff, payloadSize, 0, (struct sockaddr *) &server_addr, sizeof(server_addr));
-        
+        if (sent < 0) {
+            perror("Error sending packet");
+        } else {
+            printf("Thread sent: %d bytes from port %d to %s:%d\n", 
+                   sent, 
+                   listen_port,
+                   inet_ntoa(server_addr.sin_addr), 
+                   ntohs(server_addr.sin_port));
+        }
     }
 
+    if(buff) free(buff);
+    close(sockfd);
+    return NULL;
 }
 
 int start_scanning(int numThreads, in_addr_t start_ip, in_addr_t end_ip, unsigned char *spoof_ip, unsigned char *host) {
     unsigned long ips_per_thread = (ntohl(end_ip) - ntohl(start_ip))/numThreads;
-    pthread_t threads[numThreads];
+    pthread_t *threads = malloc(numThreads * sizeof(pthread_t));
+    Thread_Data **thread_data = malloc(numThreads * sizeof(Thread_Data*));
     printf("IPs per thread: %ld\n", ips_per_thread);
 
     for(int i = 0; i < numThreads; i++) {
-        Thread_Data *new_td = (Thread_Data *) malloc(sizeof(Thread_Data));
-        new_td -> host = malloc(strlen(host) + 1);
-        strcpy(new_td -> host, host);
-        new_td -> start = (ntohl(start_ip) + i*ips_per_thread);
-        new_td -> amount = ips_per_thread;
-        if(spoof_ip)
-            new_td -> spoof_ip = inet_addr(spoof_ip);
-        else
-            new_td -> spoof_ip = 0;
+        thread_data[i] = (Thread_Data *) malloc(sizeof(Thread_Data));
+        thread_data[i]->host = malloc(strlen(host) + 1);
+        strcpy(thread_data[i]->host, host);
+        thread_data[i]->start = (ntohl(start_ip) + i*ips_per_thread);
+        thread_data[i]->amount = ips_per_thread;
+        // if(spoof_ip)
+        //     thread_data[i]->spoof_ip = inet_addr(spoof_ip);
+        // else
+        thread_data[i]->spoof_ip = 0;
 
-        pthread_create(&threads[i], NULL, &scan_thread, new_td);
+        pthread_create(&threads[i], NULL, &scan_thread, thread_data[i]);
     }
 
-    for(int j = 0; j < numThreads; j++) pthread_join(threads[j], NULL);
+    // Wait for all threads and cleanup
+    for(int j = 0; j < numThreads; j++) {
+        pthread_join(threads[j], NULL);
+        if(thread_data[j]->host) free(thread_data[j]->host);
+        free(thread_data[j]);
+    }
+    free(thread_data);
+    free(threads);
+    return 0;
 }
 
 
 int main(int argc, char *argv[]) {
-
-    if(argc < 2) {
+    if (argc < 2) {
         printf("Error: Invalid argument length\n");
-        printf("Options:\n\t-h DNS Server IP (single scan)\n\t-d Domain to resolve\n\t-S IP of server with DNS Listener (spoof scan)\n\t-s Start IP (DNS scan range)\n\t-e End IP (DNS scan range)\n\t-t Thread count (optional default = 1)\n\t-l Listener output file (Optional default = 'dns_outfile')(Not for spoof scanning)\n");
-        printf("Usage:\n\t%s -h <DNS Server> - Test single server\n\t%s -h <DNS Server> -d <Domain> - Test single domain on single server\n\t%s -h <DNS Server> -d <Domain> -S <Server IP> - Test Single Domain on spoofed listener\n\t%s -s <Start IP> -e <End IP> (-S <Server IP>) - Scan range of IP's (Can also be spoofed)\n", argv[0], argv[0], argv[0], argv[0]);
+        printf("Options:\n");
+        printf("\t-h DNS Server IP (single scan)\n");
+        printf("\t-d Domain to resolve\n");
+        printf("\t-S IP of server with DNS Listener (spoof scan)\n");
+        printf("\t-s Start IP (DNS scan range)\n");
+        printf("\t-e End IP (DNS scan range)\n");
+        printf("\t-t Thread count (optional, default = 1)\n");
+        printf("\t-l Listener output file (optional, default = 'dns_outfile')\n");
+        printf("\t   (Not for spoof scanning)\n");
+        
+        printf("\nUsage:\n");
+        printf("\t%s -h <DNS Server> \t\t- Test single server\n", argv[0]);
+        printf("\t%s -h <DNS Server> -d <Domain> \t- Test single domain on single server\n", argv[0]);
+        printf("\t%s -h <DNS Server> -d <Domain> -S <Server IP> \t- Test single domain on spoofed listener\n", argv[0]);
+        printf("\t%s -s <Start IP> -e <End IP> (-S <Server IP>) \t- Scan range of IPs (can also be spoofed)\n", argv[0]);
+
         return -1;
     }
 
-    
     int opt;
     int payloadSize = 0;
     int thread_count = 1;
@@ -198,19 +274,17 @@ int main(int argc, char *argv[]) {
 
         switch (opt)
         {
-        case 'h': //specifies dns server
-
+        case 'h': //specifies DNS server
             printf("Host was specified: %s\n", optarg);
             dns_server = (char *) malloc(strlen(optarg) + 1);
             strcpy((char *) dns_server, optarg);
             break;
         
         case 'S':
-            printf("Spoofing enabled. Responses will go to: %s\n", optarg);
-            req_ip = (unsigned char *) malloc(strlen(optarg) + 1);
-            strcpy((char *) req_ip, optarg);
-            break;
-        
+            // printf("Spoofing enabled. Responses will go to: %s\n", optarg);
+            // req_ip = (unsigned char *) malloc(strlen(optarg) + 1);
+            // strcpy((char *) req_ip, optarg);
+            // break;
         case 's':
             printf("Start IP: %s\n", optarg);
             start_ip = (unsigned char *) malloc(strlen(optarg) + 1);
@@ -262,27 +336,35 @@ int main(int argc, char *argv[]) {
         inet_pton(AF_INET, start_ip, &start);
         inet_pton(AF_INET, end_ip, &end); //for ip 255.255.255.255 this returns -1
         start_scanning(thread_count, start, end, req_ip, host);
-    }
-    else {
+    } else {
         if(!dns_server) {
             perror("Invalid DNS server!");
             return -1;
         }
-        //add the record 
+        // Build DNS packet in correct order:
+        // 1. Start with DNS header
+        buff = encapsulateDNS(NULL, &payloadSize);
+        
+        // 2. Add query name
         buff = addRecord(buff, host, &payloadSize);
-        //add the record details
+        
+        // 3. Add question section (type and class)
         buff = addQuestion(buff, &payloadSize);
-        //add extended DNS
+        
+        // 4. Add EDNS record
         buff = addEDNS(buff, &payloadSize);
-        //add DNS header around data
-        buff = encapsulateDNS(buff, &payloadSize);
+        
+        printf("\nBuilt DNS query packet for %s\n", host);
 
         struct sockaddr_in server_addr;
         memset(&server_addr, 0, sizeof(server_addr));
 
         server_addr.sin_family = AF_INET;
         server_addr.sin_port = htons(53);
-        inet_pton(AF_INET, dns_server, &server_addr.sin_addr);
+        if (inet_pton(AF_INET, dns_server, &server_addr.sin_addr) == -1) { 
+            perror("inet_pton failed");
+            return -1;
+        }
 
         if(req_ip) {
             socket_type = SOCK_RAW;
@@ -297,27 +379,72 @@ int main(int argc, char *argv[]) {
 
         int sockfd = socket(AF_INET, socket_type, socket_protocol);
         if(sockfd < 0) {
-            perror("Coudn't create socket");
+            perror("Couldn't create socket");
             return -1;
-        }          
+        }
+
+        // Set socket options
+        int option = 1;
+        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option)) < 0) {
+            perror("setsockopt SO_REUSEADDR failed");
+            close(sockfd);
+            return -1;
+        }
+        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &option, sizeof(option)) < 0) {
+            perror("setsockopt SO_REUSEPORT failed");
+            close(sockfd);
+            return -1;
+        }
+
+        struct linger sl;
+        sl.l_onoff = 1;
+        sl.l_linger = 0;
+        if (setsockopt(sockfd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl)) < 0) {
+            perror("setsockopt SO_LINGER failed");
+            close(sockfd);
+            return -1;
+        }
+
+        // For non-spoofed queries, bind to port 53535
+        if (!req_ip) {
+            struct sockaddr_in bind_addr;
+            memset(&bind_addr, 0, sizeof(bind_addr));
+            bind_addr.sin_family = AF_INET;
+            bind_addr.sin_addr.s_addr = INADDR_ANY;
+            bind_addr.sin_port = htons(53535);
+
+            if (bind(sockfd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+                perror("Couldn't bind to port 53535");
+                close(sockfd);
+                return -1;
+            }
+            printf("Using port 53535\n");
+        }
 
         int sent = sendto(sockfd, (char *) buff, payloadSize, 0, (struct sockaddr *) &server_addr, sizeof(server_addr));
-        printf("Sending: %d bytes\n", sent);
+        printf("Sending: %d bytes to %s:%d\n", sent, dns_server, ntohs(server_addr.sin_port));
 
         if(sent < 0) {
-            printf("Error sending packet!\n");
+            perror("Error sending packet");
             return -1;
         }
+
+        printf("\nDNS Query Details:\n");
+        printf("Server: %s:%d\n", dns_server, ntohs(server_addr.sin_port));
+        printf("Query Type: 255 (ANY)\n");
+        printf("Domain: %s\n", host);
+        printf("Hex Dump:\n");
         for(int i = 0; i < payloadSize; i++) {
-            if(i%8 == 0) printf("\n");
+            if(i%16 == 0) printf("\n%04x: ", i);
             printf("%02X ", buff[i]);
-            
         }
-        printf("\n");   
+        printf("\n");
+
+        // Don't close the socket immediately - wait for response
+        sleep(1);  
         close(sockfd);
     }
     sleep(2); //let the last couple of responses roll in
-    
 
     if(host) free(host); 
     if(dns_server) free(dns_server);
